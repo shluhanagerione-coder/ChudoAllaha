@@ -65,6 +65,9 @@ YTDL_OPTIONS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
+    "socket_timeout": 30,   # ждать ответа сервера дольше, если сеть медленная
+    "retries": 5,           # повторить попытку, если сервер не ответил
+    "extractor_retries": 5,
 }
 
 FFMPEG_OPTIONS = {
@@ -256,27 +259,60 @@ async def ensure_voice(ctx) -> GuildMusicState:
     return state
 
 
+class ServiceSelect(discord.ui.Select):
+    def __init__(self, query: str):
+        options = [
+            discord.SelectOption(label="YouTube", value="yt", emoji="▶️"),
+            discord.SelectOption(label="SoundCloud", value="sc", emoji="☁️"),
+        ]
+        super().__init__(placeholder="Выбери сервис для поиска...", options=options)
+        self.query = query
+        self.chosen: str | None = None
+
+    async def callback(self, interaction: discord.Interaction):
+        self.chosen = self.values[0]
+        self.view.stop()
+        label = "YouTube" if self.chosen == "yt" else "SoundCloud"
+        await interaction.response.edit_message(
+            content=f"🔎 Ищу **{self.query}** на {label}...", view=None
+        )
+
+
+class ServiceView(discord.ui.View):
+    def __init__(self, author: discord.abc.User, query: str, timeout: float = 30):
+        super().__init__(timeout=timeout)
+        self.select = ServiceSelect(query)
+        self.add_item(self.select)
+        self.author = author
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user != self.author:
+            await interaction.response.send_message(
+                "Это меню не для тебя — напиши свою команду !play.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        self.select.disabled = True
+
+
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user}")
     print(f"Opus загружен: {discord.opus.is_loaded()}")
 
 
-@bot.command(name="play", aliases=["p"])
-async def play(ctx, *, query: str):
-    """!play <название / ссылка YouTube / SoundCloud / Spotify / прямая ссылка>"""
-    state = await ensure_voice(ctx)
-
-    # Вложение (аудиофайл), прикреплённое к сообщению
-    if not query and ctx.message.attachments:
-        query = ctx.message.attachments[0].url
-
-    await ctx.send(f"🔎 Ищу: **{query}**")
-
+async def _enqueue_and_play(ctx, state: "GuildMusicState", raw_query: str, status_msg=None):
+    """Резолвит запрос(ы), добавляет треки в очередь и запускает воспроизведение."""
     try:
-        queries = await resolve_queries(query)
+        queries = await resolve_queries(raw_query)
     except Exception as e:
-        await ctx.send(f"❌ Не удалось обработать запрос: {e}")
+        text = f"❌ Не удалось обработать запрос: {e}"
+        if status_msg:
+            await status_msg.edit(content=text)
+        else:
+            await ctx.send(text)
         return
 
     loop = asyncio.get_event_loop()
@@ -301,6 +337,39 @@ async def play(ctx, *, query: str):
 
     if not state.voice_client.is_playing() and not state.voice_client.is_paused():
         play_next(ctx.guild.id)
+
+
+@bot.command(name="play", aliases=["p"])
+async def play(ctx, *, query: str = ""):
+    """!play <название / ссылка YouTube / SoundCloud / Spotify / прямая ссылка>"""
+    state = await ensure_voice(ctx)
+
+    # Вложение (аудиофайл), прикреплённое к сообщению
+    if not query and ctx.message.attachments:
+        query = ctx.message.attachments[0].url
+
+    if not query:
+        await ctx.send("Укажи название трека или ссылку: `!play <запрос>`")
+        return
+
+    # Если это уже готовая ссылка (YouTube/SoundCloud/Spotify/прямая на
+    # файл) — сервис и так понятен из самой ссылки, меню выбора не нужно.
+    if URL_RE.match(query):
+        await ctx.send(f"🔎 Обрабатываю ссылку: **{query}**")
+        await _enqueue_and_play(ctx, state, query)
+        return
+
+    # Обычный текстовый запрос без ссылки — спрашиваем, где искать
+    view = ServiceView(ctx.author, query)
+    msg = await ctx.send(f"Где искать **{query}**?", view=view)
+    await view.wait()
+
+    if view.select.chosen is None:
+        await msg.edit(content=f"⌛ Время выбора истекло для «{query}».", view=None)
+        return
+
+    prefix = "scsearch" if view.select.chosen == "sc" else "ytsearch"
+    await _enqueue_and_play(ctx, state, f"{prefix}:{query}", status_msg=msg)
 
 
 @bot.command(name="skip", aliases=["s"])

@@ -1,51 +1,7 @@
 import asyncio
 import re
 import os
-import socket
 from collections import deque
-
-from dotenv import load_dotenv
-load_dotenv()  # подхватывает переменные из файла .env, если он есть рядом
-
-# ================= КАСТОМНЫЙ DNS =================
-# Если у тебя ломается резолвинг доменов через DNS провайдера/роутера
-# (ошибки вида "Failed to resolve ... getaddrinfo failed"), можно заставить
-# бота резолвить домены через конкретные DNS-серверы (например, публичные
-# Google/Cloudflare) вместо системных. Задаётся через .env:
-#   CUSTOM_DNS_SERVERS=8.8.8.8,1.1.1.1
-# Если переменная не задана — используется обычный DNS системы, ничего
-# не меняется.
-_custom_dns_servers = os.getenv("CUSTOM_DNS_SERVERS", "").strip()
-if _custom_dns_servers:
-    try:
-        import dns.resolver
-
-        _resolver = dns.resolver.Resolver()
-        _resolver.nameservers = [s.strip() for s in _custom_dns_servers.split(",") if s.strip()]
-
-        _original_getaddrinfo = socket.getaddrinfo
-
-        def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-            try:
-                # Если host уже IP-адрес — резолвить не нужно
-                socket.inet_aton(host)
-                return _original_getaddrinfo(host, port, family, type, proto, flags)
-            except (OSError, TypeError):
-                pass
-            try:
-                answer = _resolver.resolve(host, "A")
-                ip = str(answer[0])
-                return _original_getaddrinfo(ip, port, family, type, proto, flags)
-            except Exception:
-                # Если кастомный DNS не смог — откатываемся на обычный
-                return _original_getaddrinfo(host, port, family, type, proto, flags)
-
-        socket.getaddrinfo = _patched_getaddrinfo
-        print(f"🌐 Используются кастомные DNS-серверы: {_resolver.nameservers}")
-    except ImportError:
-        print("⚠️  CUSTOM_DNS_SERVERS задан, но пакет dnspython не установлен "
-              "(pip install dnspython) — использую обычный DNS системы.")
-# ===================================================
 
 import discord
 from discord.ext import commands
@@ -59,38 +15,19 @@ try:
 except ImportError:
     SPOTIFY_AVAILABLE = False
 
-# На некоторых системах (в т.ч. в контейнерах Railway/Nixpacks, а иногда и
-# на Windows, если discord.py установился без своей штатной DLL) discord.py
-# не находит libopus/opus сам — ищем файл библиотеки на диске напрямую.
+# На некоторых системах (в т.ч. в контейнерах Railway/Nixpacks) discord.py
+# не находит libopus по имени через ctypes.util.find_library, хотя она
+# установлена — ищем файл библиотеки на диске напрямую и грузим его.
 if not discord.opus.is_loaded():
     import glob
-    import struct
-    import sys
 
     candidates = [
-        "libopus.so.0", "libopus.so", "opus", "libopus-0.dll", "opus.dll",
+        "libopus.so.0", "libopus.so", "opus", "libopus-0.dll",
     ]
-
-    # Linux/контейнеры
     candidates += glob.glob("/usr/lib/*/libopus.so*")
     candidates += glob.glob("/usr/lib/libopus.so*")
     candidates += glob.glob("/nix/store/*/lib/libopus.so*")
     candidates += glob.glob("/opt/venv/lib/libopus.so*")
-
-    # Windows: штатный путь, откуда сама discord.py грузит DLL
-    if sys.platform == "win32":
-        try:
-            _discord_dir = os.path.dirname(discord.opus.__file__)
-            _bitness = struct.calcsize("P") * 8
-            _target = "x64" if _bitness > 32 else "x86"
-            candidates.append(
-                os.path.join(_discord_dir, "bin", f"libopus-0.{_target}.dll")
-            )
-            candidates += glob.glob(os.path.join(_discord_dir, "bin", "*.dll"))
-        except Exception:
-            pass
-        # DLL, которую пользователь мог вручную положить рядом с bot.py
-        candidates += glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "*.dll"))
 
     loaded = False
     for opus_path in candidates:
@@ -103,11 +40,6 @@ if not discord.opus.is_loaded():
 
     if not loaded:
         print("⚠️  Не удалось загрузить libopus ни по одному из путей:", candidates)
-        if sys.platform == "win32":
-            print(
-                "   На Windows это обычно чинится переустановкой пакета: "
-                "pip install --force-reinstall \"discord.py[voice]\""
-            )
 
 # ====================== НАСТРОЙКИ ======================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_БОТА")

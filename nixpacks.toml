@@ -1,6 +1,6 @@
 [phases.setup]
 nixPkgs = ["python311"]
-aptPkgs = ["ffmpeg"]
+aptPkgs = ["ffmpeg", "libopus0", "libopus-dev"]
 
 [start]
 cmd = "python bot.py"

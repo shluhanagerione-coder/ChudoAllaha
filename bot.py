@@ -15,6 +15,16 @@ try:
 except ImportError:
     SPOTIFY_AVAILABLE = False
 
+# На некоторых системах (в т.ч. в контейнерах Railway) discord.py не находит
+# libopus автоматически, хотя она установлена — подгружаем её вручную.
+if not discord.opus.is_loaded():
+    for opus_name in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll"):
+        try:
+            discord.opus.load_opus(opus_name)
+            break
+        except OSError:
+            continue
+
 # ====================== НАСТРОЙКИ ======================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_БОТА")
 

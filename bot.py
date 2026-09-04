@@ -1,7 +1,51 @@
 import asyncio
 import re
 import os
+import socket
 from collections import deque
+
+from dotenv import load_dotenv
+load_dotenv()  # подхватывает переменные из файла .env, если он есть рядом
+
+# ================= КАСТОМНЫЙ DNS =================
+# Если у тебя ломается резолвинг доменов через DNS провайдера/роутера
+# (ошибки вида "Failed to resolve ... getaddrinfo failed"), можно заставить
+# бота резолвить домены через конкретные DNS-серверы (например, публичные
+# Google/Cloudflare) вместо системных. Задаётся через .env:
+#   CUSTOM_DNS_SERVERS=8.8.8.8,1.1.1.1
+# Если переменная не задана — используется обычный DNS системы, ничего
+# не меняется.
+_custom_dns_servers = os.getenv("CUSTOM_DNS_SERVERS", "").strip()
+if _custom_dns_servers:
+    try:
+        import dns.resolver
+
+        _resolver = dns.resolver.Resolver()
+        _resolver.nameservers = [s.strip() for s in _custom_dns_servers.split(",") if s.strip()]
+
+        _original_getaddrinfo = socket.getaddrinfo
+
+        def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            try:
+                # Если host уже IP-адрес — резолвить не нужно
+                socket.inet_aton(host)
+                return _original_getaddrinfo(host, port, family, type, proto, flags)
+            except (OSError, TypeError):
+                pass
+            try:
+                answer = _resolver.resolve(host, "A")
+                ip = str(answer[0])
+                return _original_getaddrinfo(ip, port, family, type, proto, flags)
+            except Exception:
+                # Если кастомный DNS не смог — откатываемся на обычный
+                return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+        socket.getaddrinfo = _patched_getaddrinfo
+        print(f"🌐 Используются кастомные DNS-серверы: {_resolver.nameservers}")
+    except ImportError:
+        print("⚠️  CUSTOM_DNS_SERVERS задан, но пакет dnspython не установлен "
+              "(pip install dnspython) — использую обычный DNS системы.")
+# ===================================================
 
 import discord
 from discord.ext import commands
@@ -15,19 +59,38 @@ try:
 except ImportError:
     SPOTIFY_AVAILABLE = False
 
-# На некоторых системах (в т.ч. в контейнерах Railway/Nixpacks) discord.py
-# не находит libopus по имени через ctypes.util.find_library, хотя она
-# установлена — ищем файл библиотеки на диске напрямую и грузим его.
+# На некоторых системах (в т.ч. в контейнерах Railway/Nixpacks, а иногда и
+# на Windows, если discord.py установился без своей штатной DLL) discord.py
+# не находит libopus/opus сам — ищем файл библиотеки на диске напрямую.
 if not discord.opus.is_loaded():
     import glob
+    import struct
+    import sys
 
     candidates = [
-        "libopus.so.0", "libopus.so", "opus", "libopus-0.dll",
+        "libopus.so.0", "libopus.so", "opus", "libopus-0.dll", "opus.dll",
     ]
+
+    # Linux/контейнеры
     candidates += glob.glob("/usr/lib/*/libopus.so*")
     candidates += glob.glob("/usr/lib/libopus.so*")
     candidates += glob.glob("/nix/store/*/lib/libopus.so*")
     candidates += glob.glob("/opt/venv/lib/libopus.so*")
+
+    # Windows: штатный путь, откуда сама discord.py грузит DLL
+    if sys.platform == "win32":
+        try:
+            _discord_dir = os.path.dirname(discord.opus.__file__)
+            _bitness = struct.calcsize("P") * 8
+            _target = "x64" if _bitness > 32 else "x86"
+            candidates.append(
+                os.path.join(_discord_dir, "bin", f"libopus-0.{_target}.dll")
+            )
+            candidates += glob.glob(os.path.join(_discord_dir, "bin", "*.dll"))
+        except Exception:
+            pass
+        # DLL, которую пользователь мог вручную положить рядом с bot.py
+        candidates += glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "*.dll"))
 
     loaded = False
     for opus_path in candidates:
@@ -40,6 +103,11 @@ if not discord.opus.is_loaded():
 
     if not loaded:
         print("⚠️  Не удалось загрузить libopus ни по одному из путей:", candidates)
+        if sys.platform == "win32":
+            print(
+                "   На Windows это обычно чинится переустановкой пакета: "
+                "pip install --force-reinstall \"discord.py[voice]\""
+            )
 
 # ====================== НАСТРОЙКИ ======================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_БОТА")
@@ -49,6 +117,13 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
 COMMAND_PREFIX = "!"
 DEFAULT_VOLUME = 0.5
+
+# Оформление embed-сообщений
+COLOR_MAIN = 0x8B5CF6     # фиолетовый — обычные сообщения
+COLOR_SUCCESS = 0x57F287  # зелёный — успешные действия
+COLOR_ERROR = 0xED4245    # красный — ошибки
+COLOR_INFO = 0x5865F2     # синий — нейтральная инфа
+FOOTER_TEXT = "🎵 Музыкальный бот"
 # ========================================================
 
 intents = discord.Intents.default()
@@ -94,13 +169,23 @@ if SPOTIFY_AVAILABLE and SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         print(f"Не удалось инициализировать Spotify клиент: {e}")
 
 
+def make_embed(title=None, description=None, color=COLOR_MAIN, thumbnail=None, footer=FOOTER_TEXT):
+    embed = discord.Embed(title=title, description=description, color=color)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
 class Track:
-    def __init__(self, title, url, webpage_url, duration=None, requester=None):
+    def __init__(self, title, url, webpage_url, duration=None, requester=None, thumbnail=None):
         self.title = title
         self.url = url  # прямой стрим-урл для ffmpeg
         self.webpage_url = webpage_url
         self.duration = duration
         self.requester = requester
+        self.thumbnail = thumbnail
 
     def format_duration(self):
         if not self.duration:
@@ -147,6 +232,7 @@ def extract_youtube_or_direct(query: str) -> Track:
         url=data["url"],
         webpage_url=data.get("webpage_url", query),
         duration=data.get("duration"),
+        thumbnail=data.get("thumbnail"),
     )
 
 
@@ -273,9 +359,12 @@ class ServiceSelect(discord.ui.Select):
         self.chosen = self.values[0]
         self.view.stop()
         label = "YouTube" if self.chosen == "yt" else "SoundCloud"
-        await interaction.response.edit_message(
-            content=f"🔎 Ищу **{self.query}** на {label}...", view=None
+        embed = make_embed(
+            title="🔎 Ищу трек...",
+            description=f"**{self.query}**\nИсточник: {label}",
+            color=COLOR_INFO,
         )
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
 
 
 class ServiceView(discord.ui.View):
@@ -308,32 +397,55 @@ async def _enqueue_and_play(ctx, state: "GuildMusicState", raw_query: str, statu
     try:
         queries = await resolve_queries(raw_query)
     except Exception as e:
-        text = f"❌ Не удалось обработать запрос: {e}"
+        embed = make_embed(title="❌ Ошибка", description=str(e), color=COLOR_ERROR)
         if status_msg:
-            await status_msg.edit(content=text)
+            await status_msg.edit(content=None, embed=embed)
         else:
-            await ctx.send(text)
+            await ctx.send(embed=embed)
         return
 
     loop = asyncio.get_event_loop()
-    added = 0
+    added_tracks = []
     for q in queries:
         try:
             track = await loop.run_in_executor(None, extract_youtube_or_direct, q)
             track.requester = ctx.author.display_name
             state.queue.append(track)
-            added += 1
+            added_tracks.append(track)
         except Exception as e:
-            await ctx.send(f"⚠️ Пропускаю '{q}': {e}")
+            await ctx.send(embed=make_embed(
+                title="⚠️ Пропускаю трек",
+                description=f"`{q}`\n{e}",
+                color=COLOR_ERROR,
+            ))
 
-    if added == 0:
-        await ctx.send("❌ Ничего не нашлось.")
+    if not added_tracks:
+        embed = make_embed(title="❌ Ничего не нашлось", color=COLOR_ERROR)
+        if status_msg:
+            await status_msg.edit(content=None, embed=embed)
+        else:
+            await ctx.send(embed=embed)
         return
 
-    if added == 1:
-        await ctx.send(f"➕ Добавлено в очередь: **{state.queue[-1].title}**")
+    if len(added_tracks) == 1:
+        t = added_tracks[0]
+        embed = make_embed(
+            title="➕ Добавлено в очередь",
+            description=f"**{t.title}**\n⏱️ {t.format_duration()} · запросил {t.requester}",
+            color=COLOR_SUCCESS,
+            thumbnail=t.thumbnail,
+        )
     else:
-        await ctx.send(f"➕ Добавлено {added} треков в очередь.")
+        embed = make_embed(
+            title="➕ Добавлено в очередь",
+            description=f"**{len(added_tracks)}** треков",
+            color=COLOR_SUCCESS,
+        )
+
+    if status_msg:
+        await status_msg.edit(content=None, embed=embed)
+    else:
+        await ctx.send(embed=embed)
 
     if not state.voice_client.is_playing() and not state.voice_client.is_paused():
         play_next(ctx.guild.id)
@@ -349,23 +461,40 @@ async def play(ctx, *, query: str = ""):
         query = ctx.message.attachments[0].url
 
     if not query:
-        await ctx.send("Укажи название трека или ссылку: `!play <запрос>`")
+        await ctx.send(embed=make_embed(
+            title="Нужно название или ссылка",
+            description="Пример: `!play never gonna give you up`",
+            color=COLOR_ERROR,
+        ))
         return
 
     # Если это уже готовая ссылка (YouTube/SoundCloud/Spotify/прямая на
     # файл) — сервис и так понятен из самой ссылки, меню выбора не нужно.
     if URL_RE.match(query):
-        await ctx.send(f"🔎 Обрабатываю ссылку: **{query}**")
-        await _enqueue_and_play(ctx, state, query)
+        status_msg = await ctx.send(embed=make_embed(
+            title="🔎 Обрабатываю ссылку...",
+            description=query,
+            color=COLOR_INFO,
+        ))
+        await _enqueue_and_play(ctx, state, query, status_msg=status_msg)
         return
 
     # Обычный текстовый запрос без ссылки — спрашиваем, где искать
     view = ServiceView(ctx.author, query)
-    msg = await ctx.send(f"Где искать **{query}**?", view=view)
+    embed = make_embed(
+        title="Где искать?",
+        description=f"**{query}**",
+        color=COLOR_MAIN,
+    )
+    msg = await ctx.send(embed=embed, view=view)
     await view.wait()
 
     if view.select.chosen is None:
-        await msg.edit(content=f"⌛ Время выбора истекло для «{query}».", view=None)
+        await msg.edit(embed=make_embed(
+            title="⌛ Время выбора истекло",
+            description=f"**{query}**",
+            color=COLOR_ERROR,
+        ), view=None)
         return
 
     prefix = "scsearch" if view.select.chosen == "sc" else "ytsearch"
@@ -377,9 +506,9 @@ async def skip(ctx):
     state = get_state(ctx.guild.id)
     if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
         state.voice_client.stop()  # вызовет after_playing -> следующий трек
-        await ctx.send("⏭️ Пропускаю.")
+        await ctx.send(embed=make_embed(title="⏭️ Пропускаю", color=COLOR_MAIN))
     else:
-        await ctx.send("Сейчас ничего не играет.")
+        await ctx.send(embed=make_embed(title="Сейчас ничего не играет", color=COLOR_ERROR))
 
 
 @bot.command(name="pause")
@@ -387,7 +516,7 @@ async def pause(ctx):
     state = get_state(ctx.guild.id)
     if state.voice_client and state.voice_client.is_playing():
         state.voice_client.pause()
-        await ctx.send("⏸️ Пауза.")
+        await ctx.send(embed=make_embed(title="⏸️ Пауза", color=COLOR_MAIN))
 
 
 @bot.command(name="resume")
@@ -395,7 +524,7 @@ async def resume(ctx):
     state = get_state(ctx.guild.id)
     if state.voice_client and state.voice_client.is_paused():
         state.voice_client.resume()
-        await ctx.send("▶️ Продолжаю.")
+        await ctx.send(embed=make_embed(title="▶️ Продолжаю", color=COLOR_MAIN))
 
 
 @bot.command(name="stop")
@@ -405,7 +534,7 @@ async def stop(ctx):
     state.current = None
     if state.voice_client:
         state.voice_client.stop()
-    await ctx.send("⏹️ Остановлено, очередь очищена.")
+    await ctx.send(embed=make_embed(title="⏹️ Остановлено", description="Очередь очищена", color=COLOR_MAIN))
 
 
 @bot.command(name="leave", aliases=["disconnect", "dc"])
@@ -416,34 +545,50 @@ async def leave(ctx):
         state.voice_client = None
         state.queue.clear()
         state.current = None
-    await ctx.send("👋 Вышел из канала.")
+    await ctx.send(embed=make_embed(title="👋 Вышел из канала", color=COLOR_MAIN))
 
 
 @bot.command(name="queue", aliases=["q"])
 async def queue_cmd(ctx):
     state = get_state(ctx.guild.id)
     if not state.current and not state.queue:
-        await ctx.send("Очередь пуста.")
+        await ctx.send(embed=make_embed(title="Очередь пуста", color=COLOR_INFO))
         return
 
-    lines = []
-    if state.current:
-        lines.append(f"▶️ Сейчас играет: **{state.current.title}** [{state.current.format_duration()}]")
-    for i, t in enumerate(list(state.queue)[:10], start=1):
-        lines.append(f"{i}. {t.title} [{t.format_duration()}]")
-    if len(state.queue) > 10:
-        lines.append(f"...и ещё {len(state.queue) - 10} треков")
+    embed = make_embed(title="📜 Очередь", color=COLOR_MAIN)
 
-    await ctx.send("\n".join(lines))
+    if state.current:
+        embed.add_field(
+            name="▶️ Сейчас играет",
+            value=f"**{state.current.title}** [{state.current.format_duration()}]",
+            inline=False,
+        )
+        if state.current.thumbnail:
+            embed.set_thumbnail(url=state.current.thumbnail)
+
+    upcoming = list(state.queue)[:10]
+    if upcoming:
+        lines = [f"**{i}.** {t.title} [{t.format_duration()}]" for i, t in enumerate(upcoming, start=1)]
+        if len(state.queue) > 10:
+            lines.append(f"...и ещё {len(state.queue) - 10} треков")
+        embed.add_field(name="Далее", value="\n".join(lines), inline=False)
+
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="nowplaying", aliases=["np"])
 async def nowplaying(ctx):
     state = get_state(ctx.guild.id)
     if state.current:
-        await ctx.send(f"▶️ Сейчас играет: **{state.current.title}** [{state.current.format_duration()}]")
+        embed = make_embed(
+            title="▶️ Сейчас играет",
+            description=f"**{state.current.title}**\n⏱️ {state.current.format_duration()}",
+            color=COLOR_MAIN,
+            thumbnail=state.current.thumbnail,
+        )
+        await ctx.send(embed=embed)
     else:
-        await ctx.send("Сейчас ничего не играет.")
+        await ctx.send(embed=make_embed(title="Сейчас ничего не играет", color=COLOR_INFO))
 
 
 @bot.command(name="volume", aliases=["vol"])
@@ -453,19 +598,20 @@ async def volume(ctx, level: int):
     state.volume = level / 100
     if state.voice_client and state.voice_client.source:
         state.voice_client.source.volume = state.volume
-    await ctx.send(f"🔊 Громкость: {level}%")
+    await ctx.send(embed=make_embed(title="🔊 Громкость", description=f"{level}%", color=COLOR_MAIN))
 
 
 @bot.command(name="loop")
 async def loop_cmd(ctx):
     state = get_state(ctx.guild.id)
     state.loop = not state.loop
-    await ctx.send(f"🔁 Повтор текущего трека: {'включён' if state.loop else 'выключен'}")
+    status = "включён" if state.loop else "выключен"
+    await ctx.send(embed=make_embed(title="🔁 Повтор текущего трека", description=status, color=COLOR_MAIN))
 
 
 @bot.event
 async def on_command_error(ctx, error):
-    await ctx.send(f"⚠️ {error}")
+    await ctx.send(embed=make_embed(title="⚠️ Ошибка", description=str(error), color=COLOR_ERROR))
 
 
 if __name__ == "__main__":

@@ -15,15 +15,31 @@ try:
 except ImportError:
     SPOTIFY_AVAILABLE = False
 
-# На некоторых системах (в т.ч. в контейнерах Railway) discord.py не находит
-# libopus автоматически, хотя она установлена — подгружаем её вручную.
+# На некоторых системах (в т.ч. в контейнерах Railway/Nixpacks) discord.py
+# не находит libopus по имени через ctypes.util.find_library, хотя она
+# установлена — ищем файл библиотеки на диске напрямую и грузим его.
 if not discord.opus.is_loaded():
-    for opus_name in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll"):
+    import glob
+
+    candidates = [
+        "libopus.so.0", "libopus.so", "opus", "libopus-0.dll",
+    ]
+    candidates += glob.glob("/usr/lib/*/libopus.so*")
+    candidates += glob.glob("/usr/lib/libopus.so*")
+    candidates += glob.glob("/nix/store/*/lib/libopus.so*")
+    candidates += glob.glob("/opt/venv/lib/libopus.so*")
+
+    loaded = False
+    for opus_path in candidates:
         try:
-            discord.opus.load_opus(opus_name)
+            discord.opus.load_opus(opus_path)
+            loaded = True
             break
         except OSError:
             continue
+
+    if not loaded:
+        print("⚠️  Не удалось загрузить libopus ни по одному из путей:", candidates)
 
 # ====================== НАСТРОЙКИ ======================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_БОТА")
@@ -243,6 +259,7 @@ async def ensure_voice(ctx) -> GuildMusicState:
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user}")
+    print(f"Opus загружен: {discord.opus.is_loaded()}")
 
 
 @bot.command(name="play", aliases=["p"])

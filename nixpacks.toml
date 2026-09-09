@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python311"]
+nixPkgs = ["python311", "deno"]
 aptPkgs = ["ffmpeg", "libopus0", "libopus-dev"]
 
 [start]

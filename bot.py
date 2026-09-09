@@ -80,6 +80,15 @@ YTDL_OPTIONS = {
     "extractor_retries": 5,
 }
 
+# С конца 2025 yt-dlp требует внешний JS-движок для YouTube (используем
+# Deno, ставится через nixpacks.toml). Обычно работает само, если Deno
+# есть в PATH. Если по какой-то причине нет — можно указать путь явно:
+#   YTDL_JS_RUNTIME_PATH=/путь/до/deno
+_js_runtime_path = os.getenv("YTDL_JS_RUNTIME_PATH", "").strip()
+if _js_runtime_path:
+    YTDL_OPTIONS["js_runtimes"] = {"deno": {"path": _js_runtime_path}}
+    print(f"🦕 Deno указан явно: {_js_runtime_path}")
+
 # Если YouTube просит подтвердить, что бот не бот ("Sign in to confirm
 # you're not a bot") — можно передать yt-dlp куки, экспортированные из
 # своего залогиненного браузера. Способы, все через переменные окружения

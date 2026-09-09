@@ -82,26 +82,58 @@ YTDL_OPTIONS = {
 
 # Если YouTube просит подтвердить, что бот не бот ("Sign in to confirm
 # you're not a bot") — можно передать yt-dlp куки, экспортированные из
-# своего залогиненного браузера. Два способа, оба через переменные
-# окружения Railway (никогда не клади сами куки в файлы репозитория —
-# особенно если репозиторий публичный):
+# своего залогиненного браузера. Способы, все через переменные окружения
+# Railway (никогда не клади сами куки в файлы репозитория — особенно если
+# репозиторий публичный):
 #
-#   YTDL_COOKIES_CONTENT — вставь сюда ВЕСЬ текст файла cookies.txt целиком
-#                          (это самый безопасный способ для публичного репо:
-#                          сам код открыт, а куки лежат только в приватных
-#                          Variables твоего Railway-проекта)
+#   YTDL_COOKIES_CONTENT — вставь сюда ВЕСЬ текст файла cookies.txt целиком,
+#                          если он помещается в одну переменную (лимит
+#                          Railway — 32768 символов на одну переменную)
+#   YTDL_COOKIES_CONTENT_1, _2, _3, ... — если файл больше лимита, разбей
+#                          его на несколько частей (см. split_cookies.py)
+#                          и вставь каждую часть в свою переменную по
+#                          порядку — бот склеит их обратно при запуске
 #   YTDL_COOKIES_FILE    — путь к файлу куки, если он всё же лежит в репозитории
 #                          (используй только в приватном репозитории)
-_cookies_content = os.getenv("YTDL_COOKIES_CONTENT", "").strip()
 _cookies_file = os.getenv("YTDL_COOKIES_FILE", "").strip()
 
+_cookie_parts = []
+_i = 1
+while True:
+    _part = os.getenv(f"YTDL_COOKIES_CONTENT_{_i}")
+    if not _part:
+        break
+    _cookie_parts.append(_part)
+    _i += 1
+
+if _cookie_parts:
+    _cookies_content = "".join(_cookie_parts)
+    print(f"🍪 Куки для yt-dlp собраны из {len(_cookie_parts)} частей (YTDL_COOKIES_CONTENT_1..{len(_cookie_parts)})")
+else:
+    _cookies_content = os.getenv("YTDL_COOKIES_CONTENT", "").strip()
+    if _cookies_content:
+        print("🍪 Куки для yt-dlp взяты из переменной окружения YTDL_COOKIES_CONTENT")
+
 if _cookies_content:
+    # Убираем BOM (частый "невидимый" символ в начале файла, если его
+    # открывали/сохраняли в Блокноте Windows) и приводим переносы строк
+    # к единому виду — иначе yt-dlp не распознаёт заголовок формата.
+    _cookies_content = _cookies_content.lstrip("\ufeff")
+    _cookies_content = _cookies_content.replace("\r\n", "\n").replace("\r", "\n")
+
+    _first_line = _cookies_content.split("\n", 1)[0]
+    print(f"🍪 Итоговый файл куки: {len(_cookies_content)} символов, "
+          f"первая строка: {_first_line!r}")
+    if not _first_line.startswith("# Netscape") and not _first_line.startswith("# HTTP Cookie File"):
+        print("⚠️  Первая строка не похожа на заголовок Netscape cookie file — "
+              "проверь, не потерялась/не обрезалась ли она при копировании "
+              "в переменную окружения.")
+
     import tempfile
     _tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    with open(_tmp_cookie_path, "w", encoding="utf-8") as _f:
+    with open(_tmp_cookie_path, "w", encoding="utf-8", newline="\n") as _f:
         _f.write(_cookies_content)
     YTDL_OPTIONS["cookiefile"] = _tmp_cookie_path
-    print("🍪 Куки для yt-dlp взяты из переменной окружения YTDL_COOKIES_CONTENT")
 elif _cookies_file:
     YTDL_OPTIONS["cookiefile"] = _cookies_file
     print(f"🍪 Куки для yt-dlp берутся из файла: {_cookies_file}")

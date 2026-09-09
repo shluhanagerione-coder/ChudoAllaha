@@ -1,6 +1,7 @@
 import asyncio
 import re
 import os
+import time
 from collections import deque
 
 import discord
@@ -49,6 +50,8 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
 COMMAND_PREFIX = "!"
 DEFAULT_VOLUME = 0.5
+MIN_SPEED = 0.25
+MAX_SPEED = 4.0
 
 # Оформление embed-сообщений
 COLOR_MAIN = 0x8B5CF6     # фиолетовый — обычные сообщения
@@ -77,10 +80,33 @@ YTDL_OPTIONS = {
     "extractor_retries": 5,
 }
 
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
+# Если YouTube просит подтвердить, что бот не бот ("Sign in to confirm
+# you're not a bot") — можно передать yt-dlp куки, экспортированные из
+# своего залогиненного браузера. Два способа, оба через переменные
+# окружения Railway (никогда не клади сами куки в файлы репозитория —
+# особенно если репозиторий публичный):
+#
+#   YTDL_COOKIES_CONTENT — вставь сюда ВЕСЬ текст файла cookies.txt целиком
+#                          (это самый безопасный способ для публичного репо:
+#                          сам код открыт, а куки лежат только в приватных
+#                          Variables твоего Railway-проекта)
+#   YTDL_COOKIES_FILE    — путь к файлу куки, если он всё же лежит в репозитории
+#                          (используй только в приватном репозитории)
+_cookies_content = os.getenv("YTDL_COOKIES_CONTENT", "").strip()
+_cookies_file = os.getenv("YTDL_COOKIES_FILE", "").strip()
+
+if _cookies_content:
+    import tempfile
+    _tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    with open(_tmp_cookie_path, "w", encoding="utf-8") as _f:
+        _f.write(_cookies_content)
+    YTDL_OPTIONS["cookiefile"] = _tmp_cookie_path
+    print("🍪 Куки для yt-dlp взяты из переменной окружения YTDL_COOKIES_CONTENT")
+elif _cookies_file:
+    YTDL_OPTIONS["cookiefile"] = _cookies_file
+    print(f"🍪 Куки для yt-dlp берутся из файла: {_cookies_file}")
+
+BASE_FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
@@ -110,6 +136,13 @@ def make_embed(title=None, description=None, color=COLOR_MAIN, thumbnail=None, f
     return embed
 
 
+def format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+
+
 class Track:
     def __init__(self, title, url, webpage_url, duration=None, requester=None, thumbnail=None):
         self.title = title
@@ -122,9 +155,7 @@ class Track:
     def format_duration(self):
         if not self.duration:
             return "??:??"
-        m, s = divmod(int(self.duration), 60)
-        h, m = divmod(m, 60)
-        return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+        return format_seconds(self.duration)
 
 
 class GuildMusicState:
@@ -135,6 +166,10 @@ class GuildMusicState:
         self.current: Track | None = None
         self.volume = DEFAULT_VOLUME
         self.loop = False
+        self.speed = 1.0
+        self.position = 0.0       # накопленная позиция в треке (сек), на нормальной скорости
+        self.start_time = 0.0     # time.monotonic() момента, с которого считаем position
+        self.seeking = False      # True на время программного stop()+restart() при перемотке/смене скорости
 
     def next_track(self):
         if self.loop and self.current:
@@ -151,6 +186,71 @@ def get_state(guild_id: int) -> GuildMusicState:
     if guild_id not in guild_states:
         guild_states[guild_id] = GuildMusicState(guild_id)
     return guild_states[guild_id]
+
+
+def get_current_position(state: GuildMusicState) -> float:
+    """Текущая позиция воспроизведения трека в секундах (с учётом скорости)."""
+    if not state.current or not state.voice_client:
+        return 0.0
+    if state.voice_client.is_paused():
+        return state.position
+    elapsed = time.monotonic() - state.start_time
+    return state.position + elapsed * state.speed
+
+
+def build_ffmpeg_atempo_filter(speed: float) -> str | None:
+    """ffmpeg atempo поддерживает только диапазон 0.5-2.0 за один фильтр,
+    для большего/меньшего значения фильтры цепляются друг за другом."""
+    if abs(speed - 1.0) < 0.01:
+        return None
+    remaining = speed
+    filters = []
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining:.3f}")
+    return ",".join(filters)
+
+
+def start_playback(guild_id: int, track: "Track", position: float = 0.0):
+    """(Пере)запускает воспроизведение трека с нужной позиции и скорости."""
+    state = get_state(guild_id)
+    state.current = track
+    state.position = max(0.0, position)
+    state.start_time = time.monotonic()
+
+    before_options = BASE_FFMPEG_BEFORE_OPTIONS
+    if state.position > 0:
+        before_options += f" -ss {state.position:.2f}"
+
+    options = "-vn"
+    atempo = build_ffmpeg_atempo_filter(state.speed)
+    if atempo:
+        options += f' -filter:a "{atempo}"'
+
+    source = PCMVolumeTransformer(
+        FFmpegPCMAudio(track.url, before_options=before_options, options=options),
+        volume=state.volume,
+    )
+
+    def after_playing(error):
+        if error:
+            print(f"Ошибка плеера: {error}")
+        if state.seeking:
+            # Это программный рестарт (перемотка/смена скорости), а не
+            # конец трека — к следующему треку переходить не нужно.
+            state.seeking = False
+            return
+        fut = asyncio.run_coroutine_threadsafe(_advance(guild_id), bot.loop)
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"Ошибка при переходе к следующему треку: {e}")
+
+    state.voice_client.play(source, after=after_playing)
 
 
 def extract_youtube_or_direct(query: str) -> Track:
@@ -242,22 +342,7 @@ def play_next(guild_id: int):
     if not nxt:
         state.current = None
         return
-
-    state.current = nxt
-    source = PCMVolumeTransformer(
-        FFmpegPCMAudio(nxt.url, **FFMPEG_OPTIONS), volume=state.volume
-    )
-
-    def after_playing(error):
-        if error:
-            print(f"Ошибка плеера: {error}")
-        fut = asyncio.run_coroutine_threadsafe(_advance(guild_id), bot.loop)
-        try:
-            fut.result()
-        except Exception as e:
-            print(f"Ошибка при переходе к следующему треку: {e}")
-
-    state.voice_client.play(source, after=after_playing)
+    start_playback(guild_id, nxt, position=0.0)
 
 
 async def _advance(guild_id: int):
@@ -433,6 +518,78 @@ async def play(ctx, *, query: str = ""):
     await _enqueue_and_play(ctx, state, f"{prefix}:{query}", status_msg=msg)
 
 
+async def _seek_to(ctx, position: float):
+    state = get_state(ctx.guild.id)
+    if not state.current or not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
+        await ctx.send(embed=make_embed(title="Сейчас ничего не играет", color=COLOR_ERROR))
+        return
+
+    position = max(0.0, position)
+    if state.current.duration:
+        position = min(position, max(0.0, state.current.duration - 1))
+
+    was_paused = state.voice_client.is_paused()
+    state.seeking = True
+    state.voice_client.stop()
+    start_playback(ctx.guild.id, state.current, position=position)
+    if was_paused:
+        state.voice_client.pause()
+        state.position = position  # фиксируем позицию, раз на паузе
+
+    await ctx.send(embed=make_embed(
+        title="⏩ Перемотка",
+        description=f"{format_seconds(position)} / {state.current.format_duration()}",
+        color=COLOR_MAIN,
+    ))
+
+
+@bot.command(name="seek")
+async def seek_cmd(ctx, seconds: float):
+    """!seek <секунды> — перемотать на конкретную секунду трека"""
+    await _seek_to(ctx, seconds)
+
+
+@bot.command(name="forward", aliases=["fwd", "ff"])
+async def forward_cmd(ctx, seconds: float = 10):
+    """!forward [секунды] — перемотать вперёд (по умолчанию 10 сек)"""
+    state = get_state(ctx.guild.id)
+    await _seek_to(ctx, get_current_position(state) + seconds)
+
+
+@bot.command(name="rewind", aliases=["rw", "back"])
+async def rewind_cmd(ctx, seconds: float = 10):
+    """!rewind [секунды] — перемотать назад (по умолчанию 10 сек)"""
+    state = get_state(ctx.guild.id)
+    await _seek_to(ctx, get_current_position(state) - seconds)
+
+
+@bot.command(name="speed")
+async def speed_cmd(ctx, multiplier: float):
+    """!speed <множитель> — изменить скорость воспроизведения (0.25-4.0)"""
+    state = get_state(ctx.guild.id)
+    if not state.current or not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
+        await ctx.send(embed=make_embed(title="Сейчас ничего не играет", color=COLOR_ERROR))
+        return
+
+    multiplier = max(MIN_SPEED, min(MAX_SPEED, multiplier))
+    current_pos = get_current_position(state)
+    was_paused = state.voice_client.is_paused()
+
+    state.speed = multiplier
+    state.seeking = True
+    state.voice_client.stop()
+    start_playback(ctx.guild.id, state.current, position=current_pos)
+    if was_paused:
+        state.voice_client.pause()
+        state.position = current_pos
+
+    await ctx.send(embed=make_embed(
+        title="⏱️ Скорость воспроизведения",
+        description=f"{multiplier}x",
+        color=COLOR_MAIN,
+    ))
+
+
 @bot.command(name="skip", aliases=["s"])
 async def skip(ctx):
     state = get_state(ctx.guild.id)
@@ -447,6 +604,7 @@ async def skip(ctx):
 async def pause(ctx):
     state = get_state(ctx.guild.id)
     if state.voice_client and state.voice_client.is_playing():
+        state.position = get_current_position(state)
         state.voice_client.pause()
         await ctx.send(embed=make_embed(title="⏸️ Пауза", color=COLOR_MAIN))
 
@@ -455,6 +613,7 @@ async def pause(ctx):
 async def resume(ctx):
     state = get_state(ctx.guild.id)
     if state.voice_client and state.voice_client.is_paused():
+        state.start_time = time.monotonic()
         state.voice_client.resume()
         await ctx.send(embed=make_embed(title="▶️ Продолжаю", color=COLOR_MAIN))
 
@@ -464,6 +623,7 @@ async def stop(ctx):
     state = get_state(ctx.guild.id)
     state.queue.clear()
     state.current = None
+    state.speed = 1.0
     if state.voice_client:
         state.voice_client.stop()
     await ctx.send(embed=make_embed(title="⏹️ Остановлено", description="Очередь очищена", color=COLOR_MAIN))
@@ -490,9 +650,11 @@ async def queue_cmd(ctx):
     embed = make_embed(title="📜 Очередь", color=COLOR_MAIN)
 
     if state.current:
+        pos = format_seconds(get_current_position(state))
         embed.add_field(
             name="▶️ Сейчас играет",
-            value=f"**{state.current.title}** [{state.current.format_duration()}]",
+            value=f"**{state.current.title}** [{pos} / {state.current.format_duration()}]"
+                  + (f" · {state.speed}x" if abs(state.speed - 1.0) > 0.01 else ""),
             inline=False,
         )
         if state.current.thumbnail:
@@ -512,9 +674,11 @@ async def queue_cmd(ctx):
 async def nowplaying(ctx):
     state = get_state(ctx.guild.id)
     if state.current:
+        pos = format_seconds(get_current_position(state))
+        speed_line = f"\n⏱️ Скорость: {state.speed}x" if abs(state.speed - 1.0) > 0.01 else ""
         embed = make_embed(
             title="▶️ Сейчас играет",
-            description=f"**{state.current.title}**\n⏱️ {state.current.format_duration()}",
+            description=f"**{state.current.title}**\n{pos} / {state.current.format_duration()}{speed_line}",
             color=COLOR_MAIN,
             thumbnail=state.current.thumbnail,
         )

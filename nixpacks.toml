@@ -3,4 +3,4 @@ nixPkgs = ["python311", "deno"]
 aptPkgs = ["ffmpeg", "libopus0", "libopus-dev"]
 
 [start]
-cmd = "python bot.py"
+cmd = "python -u bot.py"
